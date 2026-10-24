@@ -945,6 +945,37 @@ impl PassthroughFs {
         Ok((st, self.cfg.attr_timeout))
     }
 
+    /// Whether the guest holds an open handle on the inode at `c_path`. Any doubt answers
+    /// yes, so the caller keeps the inode reachable after an unlink.
+    fn has_open_handle(&self, c_path: &CStr) -> bool {
+        let mut st = MaybeUninit::<libc::stat>::zeroed();
+        // Safe because this doesn't modify any memory but `st`, and we check the return value.
+        let res = unsafe { libc::lstat(c_path.as_ptr(), st.as_mut_ptr()) };
+        if res != 0 {
+            return true;
+        }
+        // Safe because fstatat succeeded, so it initialized `st`.
+        let st = unsafe { st.assume_init() };
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev as _,
+        };
+        let Some(inode) = self
+            .inodes
+            .read()
+            .unwrap()
+            .get_alt(&altkey)
+            .map(|data| data.inode)
+        else {
+            return false;
+        };
+        self.handles
+            .read()
+            .unwrap()
+            .values()
+            .any(|handle| handle.inode == inode)
+    }
+
     fn grab_unlinked_fd(&self, parent_fd: RawFd, name: &CStr) -> io::Result<RawFd> {
         let fd = unsafe {
             libc::openat(
@@ -994,6 +1025,21 @@ impl PassthroughFs {
         flags: libc::c_int,
     ) -> io::Result<()> {
         let ihandle = self.inode_to_handle(parent, true)?;
+
+        // An inode the guest has no open handle on is not reachable after the unlink, so it
+        // needs no preserved file descriptor, and one unlinkat by path does the whole job.
+        if let InodeHandle::Path(_) = ihandle {
+            let c_path = self.name_to_path(parent, name)?;
+            if !self.has_open_handle(&c_path) {
+                // Safe because this doesn't modify any memory and we check the return value.
+                let res = unsafe { libc::unlinkat(libc::AT_FDCWD, c_path.as_ptr(), flags) };
+                return if res == 0 {
+                    Ok(())
+                } else {
+                    Err(linux_error(io::Error::last_os_error()))
+                };
+            }
+        }
 
         let (fd, close_fd) = match ihandle {
             InodeHandle::Path(c_path) => unsafe {
