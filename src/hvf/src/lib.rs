@@ -32,6 +32,14 @@ use log::debug;
 
 unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
+    pub fn mach_continuous_time() -> u64;
+}
+
+/// Ticks the host has spent asleep since boot: `mach_absolute_time` stops
+/// while the Mac sleeps, and `mach_continuous_time` does not.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn host_sleep_ticks() -> u64 {
+    unsafe { mach_continuous_time().saturating_sub(mach_absolute_time()) }
 }
 
 const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
@@ -376,6 +384,9 @@ pub struct HvfVcpu<'a> {
     // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
     // so the WFE deadline check doesn't issue a syscall on every wait.
     vtimer_offset: Cell<u64>,
+    // The host sleep the guest counter already accounts for.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    host_sleep_seen: Cell<u64>,
 }
 
 impl HvfVcpu<'_> {
@@ -424,6 +435,8 @@ impl HvfVcpu<'_> {
             vtimer_masked: false,
             nested_enabled,
             vtimer_offset: Cell::new(0),
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            host_sleep_seen: Cell::new(host_sleep_ticks()),
         })
     }
 
@@ -609,6 +622,27 @@ impl HvfVcpu<'_> {
         Ok(())
     }
 
+    /// Carry the guest's CNTVCT across a host sleep. `mach_absolute_time`
+    /// stops while the Mac sleeps, so without this the guest's clocks fall
+    /// behind by every sleep; moving the counter forward makes the guest see
+    /// the sleep as time that passed, as Virtualization.framework does.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn catch_up_host_sleep(&self) -> Result<(), Error> {
+        let slept = host_sleep_ticks();
+        let missed = slept.saturating_sub(self.host_sleep_seen.get());
+        if missed == 0 {
+            return Ok(());
+        }
+        let offset = self.vtimer_offset.get().wrapping_sub(missed);
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+        self.vtimer_offset.set(offset);
+        self.host_sleep_seen.set(slept);
+        Ok(())
+    }
+
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
         if !self.vtimer_masked {
             return;
@@ -682,6 +716,9 @@ impl HvfVcpu<'_> {
         if pending_irq {
             vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, true)?;
         }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        self.catch_up_host_sleep()?;
 
         let ret = unsafe { hv_vcpu_run(self.vcpuid) };
         if ret != HV_SUCCESS {
@@ -823,7 +860,7 @@ impl HvfVcpu<'_> {
                 // `now` runs ahead of every armed deadline and the vCPU busy-loops
                 // on WaitForEventExpired instead of parking, so the guest's virtual
                 // timer never fires and timed sleeps hang.
-                let now = unsafe { mach_absolute_time() }.saturating_sub(self.vtimer_offset.get());
+                let now = unsafe { mach_absolute_time() }.wrapping_sub(self.vtimer_offset.get());
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }
