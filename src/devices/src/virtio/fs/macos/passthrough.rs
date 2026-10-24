@@ -1400,6 +1400,12 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // Every path lookup costs a round trip through the VMM, so let the kernel fetch a
+        // directory's attributes along with its entries, and look up names in one directory
+        // concurrently. `readdirplus` and `lookup` take no lock on the directory.
+        opts |= capable
+            & (FsOptions::DO_READDIRPLUS | FsOptions::READDIRPLUS_AUTO | FsOptions::PARALLEL_DIROPS);
+
         Ok(opts)
     }
 
@@ -1602,16 +1608,22 @@ impl FileSystem for PassthroughFs {
         F: FnMut(DirEntry, Entry) -> io::Result<usize>,
     {
         self.do_readdir(inode, handle, size, offset, |dir_entry| {
-            // Safe because the kernel guarantees that the buffer is nul-terminated. Additionally,
-            // the kernel will pad the name with '\0' bytes up to 8-byte alignment and there's no
-            // way for us to know exactly how many padding bytes there are. This would cause
-            // `CStr::from_bytes_with_nul` to return an error because it would think there are
-            // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
-            // so we'll just skip the checks here.
-            let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.lookup(ctx, inode, name)?;
-
-            add_entry(dir_entry, entry)
+            // The directory stream keeps each name without a NUL, and without "." and "..".
+            let name = CString::new(dir_entry.name).map_err(|_| einval())?;
+            let entry = self.lookup(ctx, inode, &name)?;
+            let looked_up = entry.inode;
+            match add_entry(dir_entry, entry) {
+                // The entry did not fit, so the kernel never saw the reference this lookup took.
+                Ok(0) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Ok(0)
+                }
+                Err(e) => {
+                    forget_one(&mut self.inodes.write().unwrap(), looked_up, 1);
+                    Err(e)
+                }
+                added => added,
+            }
         })
     }
 
