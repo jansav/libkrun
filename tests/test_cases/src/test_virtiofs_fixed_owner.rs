@@ -18,21 +18,27 @@ mod host {
     use crate::common::{build_and_run, build_init_config, init_krun, setup_rootfs};
     use crate::{ShouldRun, Test, TestOutcome, TestSetup};
 
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(None, &[krun::Symbol::KrunFsDeviceSetFixedOwner])
+    }
+
     impl Test for TestVirtiofsFixedOwner {
         fn should_run(&self) -> ShouldRun {
             if !cfg!(target_os = "macos") {
                 return ShouldRun::No("a fixed owner takes effect on macOS hosts only");
             }
             #[cfg(feature = "dynamic-linking")]
-            if crate::common::require_vm_symbols().is_err()
-                || krun::require(None, &[krun::Symbol::KrunFsDeviceSetFixedOwner]).is_err()
-            {
+            if require_symbols().is_err() {
                 return ShouldRun::No("krun_fs_device_set_fixed_owner not available");
             }
             ShouldRun::Yes
         }
 
         fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
             init_krun()?;
 
             let root_dir = setup_rootfs(&test_setup)?;
@@ -80,10 +86,13 @@ mod guest {
     use crate::Test;
 
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, chown};
+    use std::os::unix::fs::{MetadataExt, chown, symlink};
+
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
 
     fn assert_owner(path: &str) {
-        let meta = fs::metadata(path).unwrap_or_else(|e| panic!("stat {path}: {e}"));
+        let meta = fs::symlink_metadata(path).unwrap_or_else(|e| panic!("stat {path}: {e}"));
         assert_eq!(
             (meta.uid(), meta.gid()),
             (OWNER_UID, OWNER_GID),
@@ -104,6 +113,13 @@ mod guest {
 
             chown(&guest_file, Some(0), Some(0)).expect("chown is accepted");
             assert_owner(&guest_file);
+
+            fs::create_dir("/guest-dir").expect("mkdir");
+            assert_owner("/guest-dir");
+            mkfifo("/guest-fifo", Mode::from_bits_truncate(0o644)).expect("mkfifo");
+            assert_owner("/guest-fifo");
+            symlink(&guest_file, "/guest-link").expect("symlink");
+            assert_owner("/guest-link");
 
             println!("OK");
         }

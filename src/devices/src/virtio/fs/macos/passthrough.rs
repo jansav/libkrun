@@ -1031,9 +1031,13 @@ impl PassthroughFs {
     ) -> io::Result<()> {
         let ihandle = self.inode_to_handle(parent, true)?;
 
-        // An inode the guest has no open handle on is not reachable after the unlink, so it
-        // needs no preserved file descriptor, and one unlinkat by path does the whole job.
-        if let InodeHandle::Path(_) = ihandle {
+        // A file the guest has no open handle on is not reachable after the unlink, so it needs
+        // no preserved file descriptor, and one unlinkat by path does the whole job. A
+        // directory can stay reachable without a handle, as a process's working directory, so
+        // rmdir always keeps the descriptor.
+        if flags & libc::AT_REMOVEDIR == 0
+            && let InodeHandle::Path(_) = ihandle
+        {
             let c_path = self.name_to_path(parent, name)?;
             let _unlink = self.open_unlink.write().unwrap();
             if !self.has_open_handle(&c_path) {
@@ -2281,7 +2285,8 @@ impl FileSystem for PassthroughFs {
                     Some((ctx.uid, ctx.gid)),
                     Some(mode as u32),
                 )?;
-                (entry.attr.st_uid, entry.attr.st_gid) = self.cfg.semantics.fixed_owner(&ctx);
+                entry.attr.st_uid = ctx.uid;
+                entry.attr.st_gid = ctx.gid;
                 entry.attr.st_mode = mode;
             }
             Ok(entry)
