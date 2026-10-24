@@ -768,6 +768,33 @@ mod guest {
         fs::remove_dir_all(dir).expect("remove_dir_all");
     }
 
+    /// A directory larger than many READDIRPLUS replies lists every name once, with the
+    /// attributes the host has, and removes cleanly.
+    fn test_readdirplus_large_directory() {
+        let dir = "/test_readdirplus_large_directory";
+        fs::create_dir(dir).expect("mkdir");
+        let names: HashSet<String> = (0..3000)
+            .map(|i| format!("entry-with-a-long-name-to-fill-the-reply-buffer-{i:05}"))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            fs::write(format!("{dir}/{name}"), vec![b'x'; i % 100]).expect("write entry");
+        }
+
+        let mut seen = HashSet::new();
+        for entry in fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().into_string().expect("utf-8 name");
+            let len = entry.metadata().expect("metadata").len();
+            let on_disk = fs::metadata(format!("{dir}/{name}")).expect("stat").len();
+            assert_eq!(len, on_disk, "{name}: size from the listing");
+            assert!(seen.insert(name.clone()), "{name} listed twice");
+        }
+        assert_eq!(seen, names, "the listing holds exactly the names created");
+
+        fs::remove_dir_all(dir).expect("remove_dir_all");
+        assert!(fs::metadata(dir).is_err(), "directory removed");
+    }
+
     fn test_non_utf8_file_names() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
@@ -833,6 +860,10 @@ mod guest {
                 (
                     "unlink_open_and_closed_files",
                     test_unlink_open_and_closed_files,
+                ),
+                (
+                    "readdirplus_large_directory",
+                    test_readdirplus_large_directory,
                 ),
             ]);
         }
