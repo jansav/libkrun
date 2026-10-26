@@ -730,11 +730,6 @@ mod guest {
         }
     }
 
-    /// File names are arbitrary bytes on Linux; the server must serve them
-    /// without assuming UTF-8. The `lookup` debug log used to format the
-    /// name with `to_str().unwrap()`, which panicked the fs worker thread on
-    /// the first such name and left every later request hanging, so with
-    /// the harness's trace logging this subtest never returns on that bug.
     /// A directory larger than many READDIRPLUS replies lists every name once, with the
     /// attributes the host has, and removes cleanly.
     fn test_readdirplus_large_directory() {
@@ -762,14 +757,14 @@ mod guest {
         assert!(fs::metadata(dir).is_err(), "directory removed");
     }
 
-    /// A name removed while the guest is part-way through a listing does not end the listing:
-    /// every other name still appears.
     /// The entry's name, after a stat of it, which keeps the kernel on READDIRPLUS.
     fn listed_name(entry: fs::DirEntry) -> String {
         let _ = entry.metadata();
         entry.file_name().into_string().unwrap()
     }
 
+    /// A name removed while the guest is part-way through a listing does not end the listing:
+    /// every other name still appears.
     fn test_readdirplus_name_removed_mid_listing() {
         let dir = "/test_readdirplus_name_removed_mid_listing";
         fs::create_dir(dir).expect("mkdir");
@@ -854,6 +849,11 @@ mod guest {
         assert!(fs::metadata(dir).is_err(), "the name is gone");
     }
 
+    /// File names are arbitrary bytes on Linux; the server must serve them
+    /// without assuming UTF-8. The `lookup` debug log used to format the
+    /// name with `to_str().unwrap()`, which panicked the fs worker thread on
+    /// the first such name and left every later request hanging, so with
+    /// the harness's trace logging this subtest never returns on that bug.
     fn test_non_utf8_file_names() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
