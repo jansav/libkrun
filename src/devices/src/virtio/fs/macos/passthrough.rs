@@ -1035,9 +1035,7 @@ impl PassthroughFs {
         // no preserved file descriptor, and one unlinkat by path does the whole job. A
         // directory can stay reachable without a handle, as a process's working directory, so
         // rmdir always keeps the descriptor.
-        if flags & libc::AT_REMOVEDIR == 0
-            && let InodeHandle::Path(_) = ihandle
-        {
+        if flags & libc::AT_REMOVEDIR == 0 && matches!(ihandle, InodeHandle::Path(_)) {
             let c_path = self.name_to_path(parent, name)?;
             let _unlink = self.open_unlink.write().unwrap();
             if !self.has_open_handle(&c_path) {
