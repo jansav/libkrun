@@ -64,6 +64,11 @@ pub struct DeviceRequirements {
     pub process_shareable_memory: bool,
     /// Supplies the guest RTC, suppressing any legacy or implicit RTC.
     pub replaces_legacy_rtc: bool,
+    /// Whether this device replaces ranges of guest RAM with fresh memory to give it back to
+    /// the host. On macOS, that only frees the memory if RAM is mapped in blocks, which the
+    /// VMM then does.
+    #[cfg(target_os = "macos")]
+    pub replaces_guest_ram: bool,
 }
 
 /// Context provided to devices during attachment.
@@ -247,6 +252,14 @@ impl<'a> AttachContext<'a> {
         &self,
     ) -> Option<crossbeam_channel::Sender<utils::worker_message::WorkerMessage>> {
         self.map_sender.clone()
+    }
+
+    /// Whether the VMM mapped guest RAM in blocks, which it does for a device that declares
+    /// [`DeviceRequirements::replaces_guest_ram`]. It can fail to, in which case the VM still
+    /// starts, and the device must not replace guest RAM.
+    #[cfg(target_os = "macos")]
+    pub fn guest_ram_in_blocks(&self) -> bool {
+        self.vmm.ram_in_blocks
     }
 
     /// Append a string to the kernel command line.
@@ -1343,8 +1356,11 @@ impl BalloonDevice {
     /// On macOS, madvise() doesn't release guest memory that the guest has written to.
     /// [`FreePageReportingMode::Replace`] has the VMM replace the reported pages with fresh
     /// memory instead, which does release them. This costs a few system calls per report, and
-    /// the guest's next access to each page faults it in again. Other platforms don't implement
-    /// [`FreePageReportingMode::Replace`], and use [`FreePageReportingMode::Default`] instead.
+    /// the guest's next access to each page faults it in again. It also has the VMM map guest
+    /// RAM in blocks of 2 MiB, one map entry each, and replace whole blocks only. If it can't
+    /// map RAM like that, the VM starts anyway and uses [`FreePageReportingMode::Default`].
+    /// Other platforms don't implement [`FreePageReportingMode::Replace`], and use
+    /// [`FreePageReportingMode::Default`] instead.
     pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
         #[cfg(target_os = "macos")]
         self.inner
@@ -1360,13 +1376,25 @@ impl BalloonDevice {
 #[cfg_attr(not(feature = "ffi"), cfg(not(feature = "tee")))]
 impl<'a> AttachDevice<'a> for BalloonDevice {
     #[cfg_attr(feature = "ffi", ffier(skip))]
+    fn requirements(&self) -> DeviceRequirements {
+        DeviceRequirements {
+            #[cfg(target_os = "macos")]
+            replaces_guest_ram: self.inner.lock().unwrap().free_page_reporting_mode()
+                == FreePageReportingMode::Replace,
+            ..Default::default()
+        }
+    }
+
+    #[cfg_attr(feature = "ffi", ffier(skip))]
     fn attach(self: Box<Self>, ctx: &mut AttachContext) -> Result<(), VmmError> {
         #[cfg(target_os = "macos")]
-        self.inner
-            .lock()
-            .unwrap()
-            .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
-            .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        {
+            let mut balloon = self.inner.lock().unwrap();
+            balloon.set_guest_ram_in_blocks(ctx.guest_ram_in_blocks());
+            balloon
+                .set_map_sender(ctx.map_sender().expect("macOS requires map_sender"))
+                .map_err(|e| VmmError::Internal(format!("balloon: {e:?}")))?;
+        }
         ctx.subscribe_events(self.inner.clone())?;
         ctx.register("balloon", self.inner)
     }
@@ -2220,4 +2248,21 @@ fn resolve_parent_dirs<'a, 'b>(
         }
     }
     Ok(current)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_balloon_replaces_guest_ram_only_in_the_replace_mode() {
+        let mut balloon = BalloonDevice::new().unwrap();
+        assert!(!balloon.requirements().replaces_guest_ram);
+
+        balloon.set_free_page_reporting_mode(FreePageReportingMode::Replace);
+        assert!(balloon.requirements().replaces_guest_ram);
+
+        balloon.set_free_page_reporting_mode(FreePageReportingMode::Default);
+        assert!(!balloon.requirements().replaces_guest_ram);
+    }
 }

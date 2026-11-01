@@ -5,17 +5,13 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender, pollable_channel};
-use utils::worker_message::WorkerMessage;
+use utils::worker_message::{RECLAIM_BLOCK_SIZE, WorkerMessage};
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::defs::QUEUE_SIZE;
 use super::device::{Balloon, FRQ_INDEX, FreeRange, coalesce};
 use super::{BalloonError, FreePageReportingMode, Result};
 use crate::virtio::DeviceState;
-
-/// Smaller or unaligned reports are only madvise()d, so that the guest can't make the VMM split
-/// the stage-2 mapping of its RAM into small pieces. Linux reports 2 MiB blocks by default.
-const RECLAIM_ALIGN: u64 = 2 << 20;
 
 /// The most reports that the device takes from the queue while earlier ones are still being
 /// reclaimed; the others stay in the queue until some are done, so the guest can't make the host
@@ -192,9 +188,12 @@ fn reclaim(
     }
 }
 
+/// Smaller or unaligned reports are only madvise()d, so that the guest can't make the VMM split
+/// the stage-2 mapping of its RAM into small pieces, and because the VMM only replaces whole
+/// blocks. Linux reports 2 MiB blocks by default.
 fn reclaimable(addr: GuestAddress, len: usize) -> bool {
     let len = len as u64;
-    len != 0 && addr.0.is_multiple_of(RECLAIM_ALIGN) && len.is_multiple_of(RECLAIM_ALIGN)
+    len != 0 && addr.0.is_multiple_of(RECLAIM_BLOCK_SIZE) && len.is_multiple_of(RECLAIM_BLOCK_SIZE)
 }
 
 impl Balloon {
@@ -202,6 +201,20 @@ impl Balloon {
     /// [`Balloon::set_map_sender`].
     pub fn set_free_page_reporting_mode(&mut self, mode: FreePageReportingMode) {
         self.reclaim.mode = mode;
+    }
+
+    pub fn free_page_reporting_mode(&self) -> FreePageReportingMode {
+        self.reclaim.mode
+    }
+
+    /// Tell the balloon whether the VMM mapped guest RAM in blocks, which replacing pages needs
+    /// to free them. If it didn't, [`FreePageReportingMode::Replace`] becomes
+    /// [`FreePageReportingMode::Default`]. Must be called before [`Balloon::set_map_sender`].
+    pub fn set_guest_ram_in_blocks(&mut self, in_blocks: bool) {
+        if self.reclaim.mode == FreePageReportingMode::Replace && !in_blocks {
+            warn!("balloon: guest RAM isn't mapped in blocks, so free page reports are madvise()d");
+            self.reclaim.mode = FreePageReportingMode::Default;
+        }
     }
 
     /// Set the channel to the VMM worker, and start reclaiming reported pages through it in
@@ -407,6 +420,26 @@ mod tests {
             assert!(dev.worker.try_recv().is_err());
             assert_eq!(dev.balloon.reclaim.done_fd(), None);
         }
+    }
+
+    #[test]
+    fn test_replace_mode_madvises_if_ram_is_not_in_blocks() {
+        let mem = guest_memory();
+        let mut dev = test_util::TestDevice::new(&mem);
+        dev.balloon
+            .set_free_page_reporting_mode(FreePageReportingMode::Replace);
+        dev.balloon.set_guest_ram_in_blocks(false);
+        let (map_sender, worker) = unbounded();
+        dev.balloon.set_map_sender(map_sender).unwrap();
+
+        assert_eq!(
+            dev.balloon.free_page_reporting_mode(),
+            FreePageReportingMode::Default
+        );
+        dev.report(&[(0x40_0000, 2 << 20)]);
+        assert!(dev.balloon.process_frq());
+        assert_eq!(dev.used(), 1);
+        assert!(worker.try_recv().is_err());
     }
 
     #[test]
